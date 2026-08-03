@@ -1,0 +1,371 @@
+---
+title: "Dental Insurance IBNP Reserving — Case Study"
+subtitle: "Completion Factor, Bornhuetter-Ferguson, and Projected Paid Lag Methods"
+format: 
+  pdf:
+    geometry:
+      - left=0.75in
+      - right=0.75in
+      - top=1in
+      - bottom=1in
+    code-overflow: wrap
+    df-print: kable
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This analysis estimates incurred-but-not-paid (IBNP) claim reserves for a
+dental insurer using three complementary actuarial reserving methods:
+
+1.  **Completion Factor method** — projects ultimate claims using
+    historical payment development patterns
+2.  **Bornhuetter-Ferguson (BF) method** — blends a prior expected loss
+    ratio with actual paid claims, useful when experience is still
+    developing or premium is growing quickly
+3.  **Projected Paid Lag method** — estimates ultimate claims from the
+    incremental (rather than cumulative) percentage of claims paid at
+    each lag
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+```
+
+```{r}
+# Data is not committed to this repo (proprietary competition dataset).
+# Place the competition workbook in the local data/ folder before running:
+#   data/case_competition_data.xlsx
+data_path <- "../data/case_competition_data.xlsx"
+
+util <- read_excel(data_path, sheet = "Utilization Data")
+prem <- read_excel(data_path, sheet = "Premium Data")
+
+colnames(util)[1:3] <- c("service_month", "payment_month", "paid")
+colnames(prem)[1:2] <- c("month", "premium")
+
+util <- util |>
+  select(service_month, payment_month, paid) |>
+  filter(!is.na(service_month), !is.na(payment_month), !is.na(paid)) |>
+  mutate(
+    service_month = as.Date(service_month),
+    payment_month = as.Date(payment_month),
+    # lag = number of months between when a claim was incurred and when it was paid
+    lag = (as.integer(format(payment_month, "%Y")) - as.integer(format(service_month, "%Y"))) * 12 +
+          (as.integer(format(payment_month, "%m"))  - as.integer(format(service_month, "%m")))
+  ) |>
+  filter(lag >= 0, lag <= 20)
+
+prem <- prem |>
+  select(month, premium) |>
+  filter(!is.na(month)) |>
+  mutate(month = as.Date(month))
+
+eval_date <- as.Date("2023-05-01")
+```
+
+------------------------------------------------------------------------
+
+## Build the Cumulative Paid Triangle
+
+```{r}
+inc_tri <- util |>
+  group_by(service_month, lag) |>
+  summarise(paid = sum(paid), .groups = "drop") |>
+  pivot_wider(names_from = lag, values_from = paid, values_fill = 0) |>
+  arrange(service_month)
+
+lag_cols <- as.character(0:15)
+for (col in lag_cols) { if (!col %in% colnames(inc_tri)) inc_tri[[col]] <- 0 }
+inc_tri <- inc_tri |> select(service_month, all_of(lag_cols))
+
+# Convert incremental payments to cumulative payments across each lag
+cum_tri <- inc_tri
+for (i in 2:length(lag_cols)) {
+  cum_tri[[lag_cols[i]]] <- cum_tri[[lag_cols[i - 1]]] + cum_tri[[lag_cols[i]]]
+}
+
+# Age = how many months old each service month is as of the evaluation date
+cum_tri <- cum_tri |>
+  mutate(age = (as.integer(format(eval_date, "%Y")) - as.integer(format(service_month, "%Y"))) * 12 +
+               (as.integer(format(eval_date, "%m"))  - as.integer(format(service_month, "%m"))))
+```
+
+```{r}
+# Sanity check: what share of claims are paid by each lag?
+util |>
+  count(lag) |>
+  filter(lag >= 0, lag <= 20) |>
+  arrange(lag) |>
+  mutate(cumulative_pct = percent(cumsum(n) / sum(n), accuracy = 0.1)) |>
+  print(n = 25)
+```
+
+------------------------------------------------------------------------
+
+## Method 1: Completion Factor
+
+```{r}
+# Treat months 15+ periods old as "mature" (i.e., effectively fully paid)
+# and use them to estimate how much of ultimate claims are typically paid
+# by each earlier lag.
+mature <- cum_tri |> filter(age >= 15)
+
+completion_factors <- sapply(lag_cols, function(l) {
+  valid <- mature |> filter(.data[["15"]] > 0, .data[[l]] > 0)
+  if (nrow(valid) < 3) return(NA_real_)
+  mean(valid[[l]] / valid[["15"]])
+})
+
+cf_df <- data.frame(lag = as.integer(lag_cols), cf = completion_factors) |>
+  filter(!is.na(cf))
+```
+
+```{r}
+total_claims_paid <- util |>
+  group_by(service_month) |>
+  summarize(Total_Paid = sum(paid)) |>
+  arrange(service_month)
+
+claims_and_prems_per_month <- inner_join(total_claims_paid, prem, by = c("service_month" = "month"))
+
+insurance_loss_ratio <- claims_and_prems_per_month |>
+  mutate(Loss_Ratio_as_Percent = Total_Paid / premium * 100)
+
+dlr_graph <- insurance_loss_ratio |>
+  ggplot(aes(x = service_month, y = Loss_Ratio_as_Percent)) +
+  geom_line(color = "navy") +
+  labs(title = "Monthly Dental Loss Ratio", x = "Month", y = "Loss Ratio") +
+  theme_minimal() +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "red") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1))
+
+dlr_graph
+```
+
+```{r}
+payments_by_lag <- util |>
+  group_by(lag) |>
+  summarise(total_paid = sum(paid), .groups = "drop") |>
+  arrange(lag)
+
+combined_df <- inner_join(payments_by_lag, cf_df, by = "lag") |>
+  mutate(
+    total_claims = total_paid / cf,
+    IBNP = total_claims - total_paid
+  )
+
+# Map each service month's age to its completion factor (fully mature = 1)
+cf_by_month <- c()
+ages <- cum_tri$age
+for (i in seq_along(ages)) {
+  if (ages[i] >= 15) {
+    cf_by_month <- c(cf_by_month, 1)
+  } else {
+    cf_by_month <- c(cf_by_month, cf_df$cf[ages[i] + 1])
+  }
+}
+
+cf_loss_ratio <- cum_tri |>
+  mutate(
+    completion_factor = cf_by_month,
+    paid_to_date = `15`,
+    Ultimate = paid_to_date / completion_factor
+  ) |>
+  left_join(prem, by = c("service_month" = "month")) |>
+  mutate(CF_lossratio = Ultimate / premium) |>
+  select(service_month, CF_lossratio)
+
+cf_loss_ratio_graph <- cf_loss_ratio |>
+  ggplot(aes(x = service_month, y = CF_lossratio)) +
+  geom_line(color = "purple") +
+  labs(title = "Completion Factor Method: Adjusted Loss Ratio", x = "Month", y = "Loss Ratio") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+cf_loss_ratio_graph
+```
+
+------------------------------------------------------------------------
+
+## Method 2: Bornhuetter-Ferguson
+
+```{r}
+total_claims_paid <- util |>
+  group_by(service_month) |>
+  summarize(Total_Paid = sum(paid)) |>
+  arrange(service_month) # earliest to latest service month
+
+claims_and_prems_per_month <- inner_join(total_claims_paid, prem, by = c("service_month" = "month"))
+
+insurance_loss_ratio <- claims_and_prems_per_month |>
+  mutate(
+    Loss_Ratio_as_Percent = Total_Paid / premium * 100,
+    service_month = as.Date(service_month)
+  )
+
+# Expected proportion of ultimate claims paid by completion factor, per month
+month_completion_factor <- c()
+ages <- cum_tri$age
+for (i in seq_along(ages)) {
+  if (ages[i] >= 15) {
+    month_completion_factor <- c(month_completion_factor, 1)
+  } else {
+    month_completion_factor <- c(month_completion_factor, cf_df$cf[ages[i] + 1])
+  }
+}
+
+cum_tri <- cum_tri |>
+  mutate(Exp_Proportion_Paid_by_CF = month_completion_factor)
+
+# A priori expected loss ratio, estimated from fully mature (fully-developed) months only
+fully_mature_months <- cum_tri |>
+  filter(Exp_Proportion_Paid_by_CF == 1) |>
+  select(service_month)
+
+mature_loss_ratios <- insurance_loss_ratio |>
+  filter(service_month %in% fully_mature_months$service_month)
+
+a_priori_expected_loss_ratio <- sum(mature_loss_ratios$Loss_Ratio_as_Percent) /
+  length(mature_loss_ratios$Loss_Ratio_as_Percent) * 0.01
+
+# Step 1: % of ultimate claims still unreported at each month's current age
+percent_unreported <- 1 - month_completion_factor
+cum_tri <- cum_tri |>
+  mutate(`% Unreported` = percent_unreported)
+
+# Step 2: expected ultimate claims $ = a priori ELR x premium
+cum_tri <- cum_tri |>
+  left_join(prem, by = c("service_month" = "month")) |>
+  mutate(expected_ultimate_claims_dollar_amt = a_priori_expected_loss_ratio * premium) |>
+  select(-premium)
+
+# Step 3: BF ultimate = paid-to-date + (expected ultimate x % unreported)
+cum_tri <- cum_tri |>
+  mutate(
+    paid_to_date = mapply(function(sm, ac) {
+      col <- as.character(min(ac, 15))
+      cum_tri[cum_tri$service_month == sm, col, drop = TRUE]
+    }, service_month, age),
+    Ultimate = paid_to_date + (expected_ultimate_claims_dollar_amt * `% Unreported`)
+  )
+
+# Step 4: resulting loss ratio and chart
+loss_ratio_by_BF <- cum_tri |>
+  left_join(prem, by = c("service_month" = "month")) |>
+  mutate(BF_lossratio = Ultimate / premium) |>
+  select(service_month, BF_lossratio)
+
+BF_lossratio_graph <- loss_ratio_by_BF |>
+  ggplot(aes(x = service_month, y = BF_lossratio)) +
+  geom_line(color = "navy") +
+  labs(title = "Bornhuetter-Ferguson Method: Adjusted Loss Ratio", x = "Month", y = "Loss Ratio") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+BF_lossratio_graph
+```
+
+------------------------------------------------------------------------
+
+## Method 3: Projected Paid Lag
+
+```{r}
+lag_cols <- as.character(0:15)
+
+# Step 1: incremental % of ultimate claims paid at each lag,
+# benchmarked against mature (15+ month old) service months
+mature <- cum_tri |> filter(age >= 15)
+
+lag_inc_pcts <- sapply(lag_cols, function(l) {
+  prev_l <- as.character(as.integer(l) - 1)
+  if (l == "0") {
+    mean(mature[["0"]] / mature[["15"]], na.rm = TRUE)
+  } else {
+    mean((mature[[l]] - mature[[prev_l]]) / mature[["15"]], na.rm = TRUE)
+  }
+})
+
+lag_pct_df <- data.frame(
+  lag = as.integer(lag_cols),
+  inc_pct = lag_inc_pcts
+) |>
+  mutate(cum_pct = cumsum(inc_pct))
+
+print(lag_pct_df)
+
+# Step 2: project ultimate claims per service month
+# ultimate = paid-so-far / cumulative % expected paid by that age
+plag_estimates <- cum_tri |>
+  mutate(age_capped = pmin(age, 15)) |>
+  left_join(lag_pct_df |> select(lag, cum_pct), by = c("age_capped" = "lag")) |>
+  mutate(
+    paid_so_far = mapply(function(sm, ac) {
+      cum_tri[cum_tri$service_month == sm, as.character(ac), drop = TRUE]
+    }, service_month, age_capped),
+    projected_ultimate = ifelse(cum_pct > 0, paid_so_far / cum_pct, paid_so_far)
+  ) |>
+  select(service_month, paid_so_far, cum_pct, projected_ultimate)
+
+plag_estimates <- plag_estimates |>
+  left_join(prem, by = c("service_month" = "month")) |>
+  mutate(IBNP = projected_ultimate - paid_so_far) |>
+  select(service_month, paid_so_far, cum_pct, projected_ultimate, IBNP, premium)
+
+# Step 3: resulting loss ratio
+loss_ratio_plag <- plag_estimates |>
+  mutate(lr_plag = projected_ultimate / premium) |>
+  rename(month = service_month) |>
+  arrange(month)
+
+# Step 4: chart
+ggplot(loss_ratio_plag, aes(x = month, y = lr_plag)) +
+  geom_line(color = "#1a9641", linewidth = 1.1) +
+  geom_point(color = "#1a9641", size = 1.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.6) +
+  labs(
+    title = "Projected Paid Lag Method: Adjusted Loss Ratio",
+    x = NULL,
+    y = "Loss Ratio"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+```
+
+------------------------------------------------------------------------
+
+## Conclusion
+
+Across all three methods, the mature-month loss ratios point to an a
+priori expected loss ratio of roughly **72%**. Because premium was
+growing quickly during the experience period, pure loss-development
+approaches (like Completion Factor) are less reliable for the most
+recent, least-mature months. The **Bornhuetter-Ferguson method** was
+ultimately recommended, since it blends the a priori expected loss
+ratio with actual paid claims and is more robust when recent periods
+are still under-developed.

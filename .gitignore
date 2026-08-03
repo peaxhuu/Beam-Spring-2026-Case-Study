@@ -1,0 +1,15 @@
+# Proprietary competition data — never commit
+data/*.xlsx
+data/*.csv
+
+# Generated outputs
+output/*.pdf
+output/*.png
+*.html
+
+# R / Quarto artifacts
+.Rproj.user/
+*.Rproj
+.Rhistory
+.RData
+/.quarto/
