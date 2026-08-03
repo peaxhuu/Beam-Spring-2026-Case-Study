@@ -1,5 +1,3 @@
-# Beam-Spring-2026-Case-Study
-
 # Dental Insurance IBNP Reserving — Case Study
 
 Actuarial case competition project estimating incurred-but-not-paid (IBNP) 
