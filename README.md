@@ -34,12 +34,6 @@ data/       Not committed — see data/README.md
 output/     Generated charts/exports (gitignored by default)
 ```
 
-## Data
-The competition dataset is proprietary and is **not included** in this
-repo. To reproduce the analysis, place the workbook at
-`data/case_competition_data.xlsx` with sheets named `Utilization Data`
-and `Premium Data`. See `data/README.md` for details.
-
 ## Note
 This was completed as part of a case study competition
 (Finalist, BEAM Case Study Competition, March 2026). Shared here for
